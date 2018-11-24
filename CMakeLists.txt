@@ -32,7 +32,7 @@ link_libraries(netfilter_queue)
 # execute ldconfig
 
 # add_executable(proxy src/main.cpp libs/logger/Binaries/libP7.a src/cap_exception.cpp src/cap_exception.h src/Logger.cpp src/Logger.h src/FirewallDeprecated.cpp src/FirewallDeprecated.h src/Firewall.cpp src/Firewall.h)
-add_executable(proxy src/main.cpp src/Firewall.cpp src/Firewall.h)
+add_executable(proxy src/main.cpp src/Firewall.cpp src/Firewall.h src/Exception.h)
 
 target_link_libraries(proxy ${CMAKE_SOURCE_DIR}/libs/logger/Binaries/libP7.a)
 # add_executable(proxy main.cpp src/Sniffer.cpp src/Sniffer.h src/cap_exception.cpp src/cap_exception.h)

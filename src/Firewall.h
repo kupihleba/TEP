@@ -6,6 +6,7 @@
 #include <thread>
 #include <libmnl/libmnl.h>
 #include <vector>
+#include <experimental/propagate_const>
 
 namespace fw {
 
@@ -40,20 +41,14 @@ namespace fw {
         static Firewall &instance();
 
     private:
+        // Pointer to implementation idiom
+        struct Implementation;
+        //std::unique_ptr<Implementation> pImpl;
+        std::experimental::propagate_const<std::unique_ptr<Implementation>> pImpl;
 
-        Firewall() : isRunning(false) {};
+        Firewall();
 
         std::vector<handler_t> handlers;
-
-        std::atomic_bool isRunning;
-
-        void loop(int queue_num);
-
-        static int queue_callback(const nlmsghdr *nlh, void *data);
-
-        //void nfq_send_verdict(int queue_num, uint32_t id, Verdict verdict);
-
-        //nlmsghdr *nfq_hdr_put(char *buf, int type, uint32_t queue_num);
     };
 }
 

@@ -1,4 +1,5 @@
 #include "Firewall.h"
+#include "Exception.h"
 #include <iostream>
 
 using namespace fw;
@@ -12,92 +13,196 @@ using namespace fw;
 /* only for NFQA_CT, not needed otherwise: */
 #include <linux/netfilter/nfnetlink_conntrack.h>
 
-
 enum Verdict {
     ACCEPT = NF_ACCEPT,
     DROP = NF_DROP
 };
 
-static struct mnl_socket *nl;
+// Typedef aliases for C types
+typedef nlmsghdr NetlinkMsgHeader;
+typedef nlattr NetlinkAttribute;
 
-nlmsghdr *nfq_hdr_put(char *buf, int type, uint32_t queue_num) {
-    nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-    nlh->nlmsg_type = (NFNL_SUBSYS_QUEUE << 8) | type;
-    nlh->nlmsg_flags = NLM_F_REQUEST;
+struct Firewall::Implementation {
+    Implementation() : isRunning(false) {}
 
-    nfgenmsg *nfg = static_cast<nfgenmsg *>(mnl_nlmsg_put_extra_header(nlh, sizeof(*nfg)));
+    static mnl_socket *netlink_sock;
+
+    std::atomic_bool isRunning;
+
+    void loop(int queue_num);
+
+    static int queue_callback(const NetlinkMsgHeader *netlinkMsgHeader, void *data);
+
+    static void nfq_send_verdict(int queue_num, uint32_t id, Verdict verdict);
+
+    static NetlinkMsgHeader *nfq_hdr_put(char *buf, int type, uint32_t queue_num);
+};
+
+mnl_socket *Firewall::Implementation::netlink_sock;
+
+void Firewall::Implementation::loop(int queue_num) {
+    char *buf;
+    /* largest possible packet payload, plus netlink data overhead: */
+    auto sizeof_buf = 0xffff + (MNL_SOCKET_BUFFER_SIZE);
+    NetlinkMsgHeader *nlHeader;
+    int ret;
+    unsigned int portid;
+
+    netlink_sock = mnl_socket_open(NETLINK_NETFILTER); // open a netlink socket
+    if (netlink_sock == nullptr) {
+        throw Exception("mnl_socket_open");
+    }
+    /* mnl_socket_bind - bind netlink socket
+        Parameters:
+        netlink_sock 	netlink socket obtained via mnl_socket_open()
+        groups 	the group of message you're interested in
+        pid 	the port ID you want to use (use zero for automatic selection)
+    */
+    if (mnl_socket_bind(netlink_sock, 0, MNL_SOCKET_AUTOPID) < 0) {
+        throw Exception("mnl_socket_bind");
+    }
+    portid = mnl_socket_get_portid(netlink_sock);
+
+    buf = static_cast<char *>(alloca(sizeof_buf * sizeof(char)));
+    if (!buf) {
+        throw Exception("allocate receive buffer");
+    }
+
+//   PF_(UN)BIND is not needed with kernels 3.8 and later
+    if constexpr (config::OLD_KERNEL) {
+        nlHeader = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, 0);
+        nfq_nlmsg_cfg_put_cmd(nlHeader, AF_INET, NFQNL_CFG_CMD_PF_UNBIND);
+
+        if (mnl_socket_sendto(netlink_sock, nlHeader, nlHeader->nlmsg_len) < 0) {
+            throw Exception("mnl_socket_send");
+        }
+
+        nlHeader = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, 0);
+        nfq_nlmsg_cfg_put_cmd(nlHeader, AF_INET, NFQNL_CFG_CMD_PF_BIND);
+
+        if (mnl_socket_sendto(netlink_sock, nlHeader, nlHeader->nlmsg_len) < 0) {
+            throw Exception("mnl_socket_send");
+        }
+    }
+
+    nlHeader = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, queue_num);
+    nfq_nlmsg_cfg_put_cmd(nlHeader, AF_INET, NFQNL_CFG_CMD_BIND);
+    printf("init success\n");
+    if (mnl_socket_sendto(netlink_sock, nlHeader, nlHeader->nlmsg_len) < 0) {
+        throw Exception("mnl_socket_send");
+    }
+
+    nlHeader = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, queue_num);
+    nfq_nlmsg_cfg_put_params(nlHeader, NFQNL_COPY_PACKET, 0xffff);
+
+    mnl_attr_put_u32(nlHeader, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_GSO));
+    mnl_attr_put_u32(nlHeader, NFQA_CFG_MASK, htonl(NFQA_CFG_F_GSO));
+
+    if (mnl_socket_sendto(netlink_sock, nlHeader, nlHeader->nlmsg_len) < 0) {
+        throw Exception("mnl_socket_send");
+    }
+
+    /* ENOBUFS is signalled to userspace when packets were lost
+     * on kernel side.  In most cases, userspace isn't interested
+     * in this information, so turn it off.
+     */
+    ret = 1;
+    mnl_socket_setsockopt(netlink_sock, NETLINK_NO_ENOBUFS, &ret, sizeof(int));
+
+    while (isRunning) {
+        ret = mnl_socket_recvfrom(netlink_sock, buf, sizeof_buf);
+        if (ret == -1) {
+            throw Exception("mnl_socket_recvfrom");
+        }
+
+        ret = mnl_cb_run(buf, ret, 0, portid, Implementation::queue_callback, buf);
+        if (ret < 0) {
+            throw Exception("mnl_cb_run");
+        }
+    }
+
+    mnl_socket_close(netlink_sock);
+}
+
+
+NetlinkMsgHeader *Firewall::Implementation::nfq_hdr_put(char *buf, int type, uint32_t queue_num) {
+    NetlinkMsgHeader *nlHeader = mnl_nlmsg_put_header(buf);
+    nlHeader->nlmsg_type = (NFNL_SUBSYS_QUEUE << 8) | type;
+    nlHeader->nlmsg_flags = NLM_F_REQUEST;
+
+    nfgenmsg *nfg = static_cast<nfgenmsg *>(mnl_nlmsg_put_extra_header(nlHeader, sizeof(*nfg)));
     nfg->nfgen_family = AF_UNSPEC;
     nfg->version = NFNETLINK_V0;
     nfg->res_id = htons(queue_num);
 
-    return nlh;
+    return nlHeader;
 }
 
-void nfq_send_verdict(int queue_num, uint32_t id, Verdict verdict) {
+void Firewall::Implementation::nfq_send_verdict(int queue_num, uint32_t id, Verdict verdict) {
     char *buf = static_cast<char *>(alloca(MNL_SOCKET_BUFFER_SIZE));
-    struct nlmsghdr *nlh;
-    struct nlattr *nest;
+    NetlinkMsgHeader *nlHeader;
+    NetlinkAttribute *nest;
 
-    nlh = nfq_hdr_put(buf, NFQNL_MSG_VERDICT, queue_num);
-    nfq_nlmsg_verdict_put(nlh, id, static_cast<int>(verdict));
+    nlHeader = nfq_hdr_put(buf, NFQNL_MSG_VERDICT, queue_num);
+    nfq_nlmsg_verdict_put(nlHeader, id, static_cast<int>(verdict));
 
     /* example to set the connmark. First, start NFQA_CT section: */
-    nest = mnl_attr_nest_start(nlh, NFQA_CT);
+    nest = mnl_attr_nest_start(nlHeader, NFQA_CT);
 
     /* then, add the connmark attribute: */
-    mnl_attr_put_u32(nlh, CTA_MARK, htonl(42));
+    mnl_attr_put_u32(nlHeader, CTA_MARK, htonl(42));
     /* more conntrack attributes, e.g. CTA_LABEL, could be set here */
 
     /* end conntrack section */
-    mnl_attr_nest_end(nlh, nest);
+    mnl_attr_nest_end(nlHeader, nest);
 
-    if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-        perror("mnl_socket_send");
-        exit(EXIT_FAILURE);
+    if (mnl_socket_sendto(netlink_sock, nlHeader, nlHeader->nlmsg_len) < 0) {
+        throw Exception("mnl_socket_send");
     }
 }
 
-int Firewall::queue_callback(const nlmsghdr *nlh, void *data) {
+[[nodiscard]]
+int Firewall::Implementation::queue_callback(const NetlinkMsgHeader *netlinkMsgHeader, void *data) {
 
-    nfqnl_msg_packet_hdr *ph = nullptr;
-    nlattr *attr[NFQA_MAX + 1] = {};
+    nfqnl_msg_packet_hdr *packetHeader = nullptr;
+    NetlinkAttribute *attr[NFQA_MAX + 1] = {};
     uint32_t _id = 0, skbinfo;
     nfgenmsg *nfg;
-    uint16_t plen;
+    uint16_t payloadLength;
 
-    if (nfq_nlmsg_parse(nlh, attr) < 0) {
+    if (nfq_nlmsg_parse(netlinkMsgHeader, attr) < 0) {
         perror("problems parsing");
         return MNL_CB_ERROR;
     }
 
 
-    nfg = static_cast<nfgenmsg *>(mnl_nlmsg_get_payload(nlh));
+    nfg = static_cast<nfgenmsg *>(mnl_nlmsg_get_payload(netlinkMsgHeader));
 
     if (attr[NFQA_PACKET_HDR] == nullptr) {
         fputs("metaheader not set\n", stderr);
         return MNL_CB_ERROR;
     }
 
-    ph = static_cast<nfqnl_msg_packet_hdr *>(mnl_attr_get_payload(attr[NFQA_PACKET_HDR]));
+    packetHeader = static_cast<nfqnl_msg_packet_hdr *>(mnl_attr_get_payload(attr[NFQA_PACKET_HDR]));
 
 
-    plen = mnl_attr_get_payload_len(attr[NFQA_PAYLOAD]);
+    payloadLength = mnl_attr_get_payload_len(attr[NFQA_PAYLOAD]);
     void *payload = mnl_attr_get_payload(attr[NFQA_PAYLOAD]);
 
     skbinfo = attr[NFQA_SKB_INFO] ? ntohl(mnl_attr_get_u32(attr[NFQA_SKB_INFO])) : 0;
 
     if (attr[NFQA_CAP_LEN]) {
         uint32_t orig_len = ntohl(mnl_attr_get_u32(attr[NFQA_CAP_LEN]));
-        if (orig_len != plen)
+        if (orig_len != payloadLength)
             printf("truncated ");
     }
 
     if (skbinfo & NFQA_SKB_GSO)
         printf("GSO ");
 
-    _id = ntohl(ph->packet_id);
+    _id = ntohl(packetHeader->packet_id);
     printf("packet received (_id=%u hw=0x%04x hook=%u, payload len %u",
-           _id, ntohs(ph->hw_protocol), ph->hook, plen);
+           _id, ntohs(packetHeader->hw_protocol), packetHeader->hook, payloadLength);
 
     /*
      * ip/tcp checksums are not yet valid, e.g. due to GRO/GSO.
@@ -110,8 +215,8 @@ int Firewall::queue_callback(const nlmsghdr *nlh, void *data) {
         printf(", checksum not ready");
     puts(")");
 
-    Tins::IP pdu(static_cast<const uint8_t *>(payload), plen);
-    //Tins::IP ip(static_cast<const uint8_t *>(payload), plen);
+    Tins::IP pdu(static_cast<const uint8_t *>(payload), payloadLength);
+    //Tins::IP ip(static_cast<const uint8_t *>(payload), payloadLength);
     //Tins::PacketSender sender;
     try {
         auto *ip = pdu.find_pdu<Tins::IP>();
@@ -149,9 +254,9 @@ int Firewall::queue_callback(const nlmsghdr *nlh, void *data) {
 }
 
 void Firewall::run() {
-    if (!isRunning) {
-        isRunning.store(true);
-        loop(0);
+    if (!pImpl->isRunning) {
+        pImpl->isRunning.store(true);
+        pImpl->loop(0);
     }
 }
 
@@ -161,7 +266,7 @@ Firewall &Firewall::instance() {
 }
 
 void Firewall::stop() {
-    isRunning.store(false);
+    pImpl->isRunning.store(false);
 }
 
 void Firewall::addHandler(Firewall::handler_t &&handler) {
@@ -173,96 +278,6 @@ void Firewall::addHandler(const Firewall::handler_t &handler) {
     handlers.emplace_back(handler);
 }
 
-void Firewall::loop(int queue_num) {
-    char *buf;
-    /* largest possible packet payload, plus netlink data overhead: */
-    auto sizeof_buf = 0xffff + (MNL_SOCKET_BUFFER_SIZE);
-    nlmsghdr *nlh;
-    int ret;
-    unsigned int portid;
-
-    nl = mnl_socket_open(NETLINK_NETFILTER); // open a netlink socket
-    if (nl == nullptr) {
-        perror("mnl_socket_open");
-        exit(EXIT_FAILURE);
-    }
-    /* mnl_socket_bind - bind netlink socket
-        Parameters:
-        nl 	netlink socket obtained via mnl_socket_open()
-        groups 	the group of message you're interested in
-        pid 	the port ID you want to use (use zero for automatic selection)
-    */
-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        perror("mnl_socket_bind");
-        exit(EXIT_FAILURE);
-    }
-    portid = mnl_socket_get_portid(nl);
-
-    buf = static_cast<char *>(alloca(sizeof_buf * sizeof(char)));
-    if (!buf) {
-        perror("allocate receive buffer");
-        exit(EXIT_FAILURE);
-    }
-
-//   PF_(UN)BIND is not needed with kernels 3.8 and later
-    if constexpr (false) {
-        nlh = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, 0);
-        nfq_nlmsg_cfg_put_cmd(nlh, AF_INET, NFQNL_CFG_CMD_PF_UNBIND);
-
-        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-            perror("mnl_socket_send");
-            exit(EXIT_FAILURE);
-        }
-
-        nlh = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, 0);
-        nfq_nlmsg_cfg_put_cmd(nlh, AF_INET, NFQNL_CFG_CMD_PF_BIND);
-
-        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-            perror("mnl_socket_send");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    nlh = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, queue_num);
-    nfq_nlmsg_cfg_put_cmd(nlh, AF_INET, NFQNL_CFG_CMD_BIND);
-    printf("init success\n");
-    if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-        perror("mnl_socket_send");
-        exit(EXIT_FAILURE);
-    }
-
-    nlh = nfq_hdr_put(buf, NFQNL_MSG_CONFIG, queue_num);
-    nfq_nlmsg_cfg_put_params(nlh, NFQNL_COPY_PACKET, 0xffff);
-
-    mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_GSO));
-    mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_GSO));
-
-    if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-        perror("mnl_socket_send");
-        exit(EXIT_FAILURE);
-    }
-
-    /* ENOBUFS is signalled to userspace when packets were lost
-     * on kernel side.  In most cases, userspace isn't interested
-     * in this information, so turn it off.
-     */
-    ret = 1;
-    mnl_socket_setsockopt(nl, NETLINK_NO_ENOBUFS, &ret, sizeof(int));
-
-    while (isRunning) {
-        ret = mnl_socket_recvfrom(nl, buf, sizeof_buf);
-        if (ret == -1) {
-            perror("mnl_socket_recvfrom");
-            exit(EXIT_FAILURE);
-        }
-
-        ret = mnl_cb_run(buf, ret, 0, portid, Firewall::queue_callback, buf);
-        if (ret < 0) {
-            perror("mnl_cb_run");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    mnl_socket_close(nl);
-
+fw::Firewall::Firewall() {
+    pImpl = std::make_unique<Implementation>();
 }
