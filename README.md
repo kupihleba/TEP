@@ -7,6 +7,8 @@ Program that behaves like a firewall, that encapsulates IP packets into encrypte
 * [Tins][Tins] (High-level library for parsing & sending packets) 
 * libmnl-dev (Netlink library) _# apt install libmnl-dev_
 * [netfilter_queue][netfilter_queue] (API for packets, that have been queued by the kernel packet filter)
+* jsoncpp
+* ZeroMQ
 
 Remember running `# ldconfig` after installation of libraries.
 
